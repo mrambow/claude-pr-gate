@@ -53,10 +53,18 @@ jobs:
           fetch-depth: 0
 
       - name: Claude PR Review Gate
-        uses: mrambow/claude-pr-gate@v1
+        # Pin to a full commit SHA for maximum security and immutability
+        uses: mrambow/claude-pr-gate@v1 # or @<commit-sha>
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          diff-excludes: "':!package-lock.json' ':!*.min.*' ':!**/dist/**' ':!**/bin/**' ':!**/obj/**'"
+          diff-excludes: |
+            :!package-lock.json
+            :!pnpm-lock.yaml
+            :!yarn.lock
+            :!*.min.*
+            :!**/dist/**
+            :!**/bin/**
+            :!**/obj/**
 ```
 
 ---

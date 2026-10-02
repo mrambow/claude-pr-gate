@@ -19,9 +19,16 @@ inputs:
     required: false
     default: "${{ github.base_ref }}"
   diff-excludes:
-    description: "Additional path patterns to exclude from git diff"
+    description: "Additional path patterns to exclude from git diff (one per line or space-separated, without shell quotes)"
     required: false
-    default: "':!package-lock.json' ':!pnpm-lock.yaml' ':!yarn.lock' ':!*.min.*' ':!*.snap' ':!*.svg' ':!**/dist/**'"
+    default: |
+      :!package-lock.json
+      :!pnpm-lock.yaml
+      :!yarn.lock
+      :!*.min.*
+      :!*.snap
+      :!*.svg
+      :!**/dist/**
   model:
     description: "Claude model to use for reviews"
     required: false
@@ -53,7 +60,21 @@ runs:
         BASE_REF: ${{ inputs.base-ref }}
         DIFF_EXCLUDES: ${{ inputs.diff-excludes }}
       run: |
-        eval "git diff -U10 \"origin/${BASE_REF}...HEAD\" -- . ${DIFF_EXCLUDES}" > pr_diff.txt
+        excludes_args=()
+        while IFS= read -r line || [ -n "$line" ]; do
+          for item in $line; do
+            # Anführungszeichen strippen, falls vom Caller versehentlich mitgegeben
+            item="${item#\'}"
+            item="${item%\'}"
+            item="${item#\"}"
+            item="${item%\"}"
+            if [ -n "$item" ]; then
+              excludes_args+=("$item")
+            fi
+          done
+        done <<< "$DIFF_EXCLUDES"
+
+        git diff -U10 "origin/${BASE_REF}...HEAD" -- . "${excludes_args[@]}" > pr_diff.txt
         echo "Diff-Größe: $(wc -c < pr_diff.txt) Bytes"
 
     - name: Claude Review ausführen
