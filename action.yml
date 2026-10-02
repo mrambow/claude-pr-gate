@@ -1,0 +1,72 @@
+name: "Claude PR Review Gate"
+description: "AI-powered PR review gatekeeper using Anthropic Claude with strict fail-closed security and prompt-injection defense."
+author: "Marc Rambow (circularis.dev)"
+
+branding:
+  icon: "check-circle"
+  color: "purple"
+
+inputs:
+  anthropic-api-key:
+    description: "Anthropic API Key"
+    required: true
+  github-token:
+    description: "GitHub Token for posting review comments"
+    required: false
+    default: "${{ github.token }}"
+  base-ref:
+    description: "Base branch ref to compare against (e.g. main, master)"
+    required: false
+    default: "${{ github.base_ref }}"
+  diff-excludes:
+    description: "Additional path patterns to exclude from git diff"
+    required: false
+    default: "':!package-lock.json' ':!pnpm-lock.yaml' ':!yarn.lock' ':!*.min.*' ':!*.snap' ':!*.svg' ':!**/dist/**'"
+  model:
+    description: "Claude model to use for reviews"
+    required: false
+    default: "claude-opus-5-5"
+  guidelines-file:
+    description: "Path to guidelines markdown file (e.g. AGENTS.md)"
+    required: false
+    default: "AGENTS.md"
+  max-diff-chars:
+    description: "Maximum diff characters before truncation"
+    required: false
+    default: "400000"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Python einrichten
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.12"
+
+    - name: Abhängigkeiten installieren
+      shell: bash
+      run: pip install -r "${{ github.action_path }}/src/requirements.txt"
+
+    - name: Git-Diff extrahieren
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        DIFF_EXCLUDES: ${{ inputs.diff-excludes }}
+      run: |
+        eval "git diff -U10 \"origin/${BASE_REF}...HEAD\" -- . ${DIFF_EXCLUDES}" > pr_diff.txt
+        echo "Diff-Größe: $(wc -c < pr_diff.txt) Bytes"
+
+    - name: Claude Review ausführen
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        BASE_REF: ${{ inputs.base-ref }}
+        REVIEW_MODEL: ${{ inputs.model }}
+        GUIDELINES_FILE: ${{ inputs.guidelines-file }}
+        MAX_DIFF_CHARS: ${{ inputs.max-diff-chars }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: python "${{ github.action_path }}/src/claude_review.py"
