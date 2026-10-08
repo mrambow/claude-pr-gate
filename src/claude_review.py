@@ -17,6 +17,7 @@ EFFORT = os.environ.get("REVIEW_EFFORT") or "medium"
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16000"))
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "400000"))
+FAIL_ON_TRUNCATED = os.environ.get("FAIL_ON_TRUNCATED", "false").lower() in ("true", "1", "yes")
 NON_BLOCKING_SEVERITIES = {"minor"}
 GUIDELINES_FILE = Path(os.environ.get("GUIDELINES_FILE", "AGENTS.md"))
 MAX_GUIDELINES_CHARS = int(os.environ.get("MAX_GUIDELINES_CHARS", "20000"))
@@ -446,7 +447,13 @@ def format_comment(
         "",
     ]
     if truncated:
-        lines += ["> ⚠️ Der Diff war zu groß und wurde abgeschnitten. Bitte den PR aufteilen.", ""]
+        if passed:
+            lines += [
+                "> ⚠️ **Warnung:** Der Diff war zu groß und wurde abgeschnitten. Nicht alle geänderten Dateien wurden vollständig geprüft.",
+                "",
+            ]
+        else:
+            lines += ["> ⚠️ Der Diff war zu groß und wurde abgeschnitten. Bitte den PR aufteilen.", ""]
 
     order = {"blocker": 0, "major": 1, "minor": 2}
     issues = review["issues"]
@@ -530,7 +537,10 @@ def main() -> int:
 
         issues = review["issues"]
         blocking = find_blocking_issues(issues)
-        passed = not blocking and not truncated
+        fail_on_trunc = os.environ.get(
+            "FAIL_ON_TRUNCATED", str(FAIL_ON_TRUNCATED)
+        ).lower() in ("true", "1", "yes")
+        passed = (not blocking and not truncated) if fail_on_trunc else not blocking
 
         post_comment(
             format_comment(
@@ -541,7 +551,12 @@ def main() -> int:
             )
         )
         if passed:
-            print("Review bestanden.")
+            if truncated:
+                print(
+                    "Review bestanden mit Warnung: Diff wurde wegen Überlänge abgeschnitten."
+                )
+            else:
+                print("Review bestanden.")
         elif truncated and not blocking:
             print("Review nicht bestanden: Diff wurde wegen Überlänge abgeschnitten.")
         else:

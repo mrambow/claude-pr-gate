@@ -49,6 +49,10 @@ inputs:
     description: "Number of context lines around changes for git diff (-U<n>)"
     required: false
     default: "5"
+  fail-on-truncated:
+    description: "Whether to fail the review when the diff exceeds max-diff-chars and is truncated (default: false)"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -107,6 +111,7 @@ runs:
         REVIEW_EFFORT: ${{ inputs.effort }}
         GUIDELINES_FILE: ${{ inputs.guidelines-file }}
         MAX_DIFF_CHARS: ${{ inputs.max-diff-chars }}
+        FAIL_ON_TRUNCATED: ${{ inputs.fail-on-truncated }}
         DIFF_EXCLUDES: ${{ inputs.diff-excludes }}
         DIFF_CONTEXT_LINES: ${{ inputs.diff-context-lines }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

@@ -464,11 +464,32 @@ def test_main_blocked(tmp_path, monkeypatch):
         assert "CHANGES REQUESTED" in posted_body
 
 
-def test_main_truncated_without_blocking_issues(tmp_path, monkeypatch):
+def test_main_truncated_without_blocking_issues_passes_by_default(tmp_path, monkeypatch):
     diff_file = tmp_path / "pr_diff.txt"
     large_diff = "diff-line\n" * (MAX_DIFF_CHARS // 5)
     diff_file.write_text(large_diff, encoding="utf-8")
     monkeypatch.setattr("claude_review.DIFF_FILE", diff_file)
+    monkeypatch.delenv("FAIL_ON_TRUNCATED", raising=False)
+
+    with patch("claude_review.run_review") as mock_review, patch("claude_review.post_comment") as mock_post:
+        mock_review.return_value = {
+            "summary": "Keine Mängel im Teil-Diff",
+            "issues": [],
+        }
+        exit_code = main()
+        assert exit_code == 0
+        mock_post.assert_called_once()
+        posted_body = mock_post.call_args[0][0]
+        assert "PASSED" in posted_body
+        assert "Der Diff war zu groß und wurde abgeschnitten" in posted_body
+
+
+def test_main_truncated_without_blocking_issues_fails_when_configured(tmp_path, monkeypatch):
+    diff_file = tmp_path / "pr_diff.txt"
+    large_diff = "diff-line\n" * (MAX_DIFF_CHARS // 5)
+    diff_file.write_text(large_diff, encoding="utf-8")
+    monkeypatch.setattr("claude_review.DIFF_FILE", diff_file)
+    monkeypatch.setenv("FAIL_ON_TRUNCATED", "true")
 
     with patch("claude_review.run_review") as mock_review, patch("claude_review.post_comment") as mock_post:
         mock_review.return_value = {

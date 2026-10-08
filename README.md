@@ -100,6 +100,7 @@ jobs:
 | `guidelines-file` | Path to project guidelines (relative to repo root) | No | `AGENTS.md` |
 | `max-diff-chars` | Max diff character limit before truncation | No | `400000` |
 | `diff-context-lines` | Number of context lines around changes for git diff (-U<n>) | No | `5` |
+| `fail-on-truncated` | Whether to fail the PR review when the diff exceeds `max-diff-chars` (`true`/`false`) | No | `false` |
 
 ---
 
@@ -129,6 +130,10 @@ Große PRs und iterative Fixes können bei LLM-Reviews schnell das Budget belast
 5. **Spend-Limits in Anthropic einrichten**:
    - Erstelle in der Anthropic Console einen separaten Workspace oder API-Key für CI/Actions.
    - Hinterlege ein striktes monatliches Budget-Limit (Spend Limit), damit fehlerhafte Endlosschleifen oder Riesen-PRs niemals dein primäres Entwicklungsbudget aufbrauchen.
+
+6. **Trunkierungs-Verhalten (`fail-on-truncated: false`)**:
+   - Überschreitet ein PR `max-diff-chars`, blockiert das Gate nicht mehr automatisch mit `CHANGES REQUESTED`, sondern besteht mit einer sichtbaren Warnung (`⚠️ Nicht alle Dateien wurden geprüft`), sofern keine Blocker/Major-Issues im sichtbaren Teil gefunden wurden.
+   - Wer striktes Blockieren wünscht, setzt `fail-on-truncated: "true"`.
 
 ---
 
