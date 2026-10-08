@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -14,11 +15,16 @@ from claude_review import (
     MAX_GUIDELINES_CHARS,
     MAX_STAT_CHARS,
     NON_BLOCKING_SEVERITIES,
+    fetch_previous_review,
     find_blocking_issues,
     format_comment,
     format_header,
+    get_incremental_diff,
+    is_ancestor_commit,
     load_guidelines,
+    log_usage,
     main,
+    parse_diff_excludes,
     post_comment,
     read_diff,
     read_file_summary,
@@ -492,3 +498,217 @@ def test_main_exception_handling(tmp_path, monkeypatch):
         posted_body = mock_post.call_args[0][0]
         assert "❌ **FEHLER**" in posted_body
         assert "API connection timeout" in posted_body
+
+
+def test_parse_diff_excludes():
+    assert parse_diff_excludes("") == []
+    raw = """
+    :!package-lock.json
+    ':!pnpm-lock.yaml' ":!yarn.lock"
+    :!*.min.*
+    """
+    assert parse_diff_excludes(raw) == [
+        ":!package-lock.json",
+        ":!pnpm-lock.yaml",
+        ":!yarn.lock",
+        ":!*.min.*",
+    ]
+
+
+def test_is_ancestor_commit():
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+        assert is_ancestor_commit("abcdef1") is True
+        mock_run.assert_called_once_with(
+            ["git", "merge-base", "--is-ancestor", "abcdef1", "HEAD"],
+            capture_output=True,
+            env=mock_run.call_args[1]["env"],
+        )
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1)
+        assert is_ancestor_commit("deadbeef") is False
+
+    with patch("subprocess.run", side_effect=OSError("git not found")):
+        assert is_ancestor_commit("abcdef1") is False
+
+
+def test_fetch_previous_review_without_pr_number(monkeypatch):
+    monkeypatch.delenv("PR_NUMBER", raising=False)
+    sha, body = fetch_previous_review()
+    assert sha == ""
+    assert body == ""
+
+
+def test_fetch_previous_review_gh_failure(monkeypatch):
+    monkeypatch.setenv("PR_NUMBER", "42")
+    with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["gh"])):
+        sha, body = fetch_previous_review()
+        assert sha == ""
+        assert body == ""
+
+
+def test_fetch_previous_review_finds_last_comment(monkeypatch):
+    monkeypatch.setenv("PR_NUMBER", "42")
+    monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+
+    fake_comments = [
+        {"body": "Normaler PR-Kommentar von jemandem."},
+        {"body": "## 🤖 Claude Review Gate (`1111111`): ❌ **CHANGES REQUESTED**\n\nIssue 1"},
+        {"body": "Zweiter Kommentar"},
+        {"body": "## 🤖 Claude Review Gate (`2222222`): ❌ **CHANGES REQUESTED**\n\nIssue 2"},
+    ]
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            stdout=json.dumps({"comments": fake_comments}),
+            returncode=0,
+        )
+        sha, body = fetch_previous_review()
+        assert sha == "2222222"
+        assert "Issue 2" in body
+
+
+def test_fetch_previous_review_skips_same_sha(monkeypatch):
+    monkeypatch.setenv("PR_NUMBER", "42")
+    monkeypatch.setenv("PR_HEAD_SHA", "2222222abcdef")
+
+    fake_comments = [
+        {"body": "## 🤖 Claude Review Gate (`1111111`): ❌ **CHANGES REQUESTED**\n\nIssue 1"},
+        {"body": "## 🤖 Claude Review Gate (`2222222`): ❌ **CHANGES REQUESTED**\n\nIssue 2"},
+    ]
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            stdout=json.dumps({"comments": fake_comments}),
+            returncode=0,
+        )
+        sha, body = fetch_previous_review()
+        # 2222222 entspricht dem aktuellen HEAD -> überspringen und vorherigen nehmen!
+        assert sha == "1111111"
+        assert "Issue 1" in body
+
+
+def test_get_incremental_diff_success():
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = [
+            MagicMock(stdout=" app.py | 2 +-\n", returncode=0),  # stat
+            MagicMock(stdout="diff --git a/app.py b/app.py\n+new line", returncode=0),  # diff
+        ]
+
+        diff, stat, truncated = get_incremental_diff(
+            "1111111", 5, [":!package-lock.json"]
+        )
+
+        assert "+new line" in diff
+        assert "app.py | 2 +-" in stat
+        assert not truncated
+        assert mock_run.call_count == 2
+        diff_cmd = mock_run.call_args_list[1][0][0]
+        assert diff_cmd == [
+            "git",
+            "diff",
+            "-U5",
+            "1111111..HEAD",
+            "--",
+            ".",
+            ":!package-lock.json",
+        ]
+
+
+def test_log_usage_with_step_summary(tmp_path, monkeypatch, capsys):
+    summary_file = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    usage_mock = MagicMock(
+        input_tokens=1500,
+        output_tokens=300,
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=800,
+    )
+
+    log_usage(usage_mock)
+
+    out = capsys.readouterr().out
+    assert "Input Tokens:        1,500" in out
+    assert "Output Tokens:       300" in out
+    assert "Cache Creation:      100" in out
+    assert "Cache Read:          800" in out
+
+    assert summary_file.exists()
+    content = summary_file.read_text(encoding="utf-8")
+    assert "### 🪙 Claude Review Token Usage" in content
+    assert "| Input Tokens | 1,500 |" in content
+    assert "| Output Tokens (inkl. Reasoning) | 300 |" in content
+    assert "| Cache Read Tokens | 800 |" in content
+    assert "| **Gesamt** | **2,700** |" in content
+
+
+def test_log_usage_none_or_missing(capsys):
+    log_usage(None)
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_format_comment_with_incremental_badge():
+    review = {"summary": "Alles behoben.", "issues": []}
+    comment = format_comment(review, passed=True, truncated=False, last_sha="1111111")
+    assert "> ℹ️ **Inkrementelles Re-Review** (Delta seit `1111111`)" in comment
+    assert "✅ **PASSED**" in comment
+
+
+def test_run_review_incremental_prompt(monkeypatch):
+    with patch("claude_review.load_guidelines", return_value=""), patch("claude_review.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+
+        mock_block = MagicMock()
+        mock_block.type = "tool_use"
+        mock_block.name = "submit_review"
+        mock_block.input = {"summary": "Behoben", "issues": []}
+
+        mock_response = MagicMock()
+        mock_response.stop_reason = "tool_use"
+        mock_response.content = [mock_block]
+        mock_response.usage = MagicMock(input_tokens=100, output_tokens=50)
+        mock_client.messages.create.return_value = mock_response
+
+        prev_review = "## 🤖 Claude Review Gate (`1111111`): ❌ **CHANGES REQUESTED**\n- Bug in app.py"
+        run_review(
+            "diff delta",
+            previous_review=prev_review,
+            last_sha="1111111",
+            file_summary=" app.py | 1 +",
+        )
+
+        call_kwargs = mock_client.messages.create.call_args[1]
+        user_content = call_kwargs["messages"][0]["content"]
+
+        assert '<incremental_review last_reviewed_sha="1111111">' in user_content
+        assert "ACHTUNG - INKREMENTELLES RE-REVIEW:" in user_content
+        assert "<previous_review>" in user_content
+        assert "Bug in app.py" in user_content
+        assert "<changed_files>\n app.py | 1 +\n</changed_files>" in user_content
+
+
+def test_main_incremental_flow(monkeypatch):
+    with (
+        patch("claude_review.fetch_previous_review", return_value=("1111111", "Vorheriger Kommentar mit Mängeln")),
+        patch("claude_review.is_ancestor_commit", return_value=True),
+        patch("claude_review.get_incremental_diff", return_value=("delta diff content", "stat", False)),
+        patch("claude_review.run_review") as mock_run_review,
+        patch("claude_review.post_comment") as mock_post,
+    ):
+        mock_run_review.return_value = {"summary": "Behoben", "issues": []}
+        exit_code = main()
+
+        assert exit_code == 0
+        mock_run_review.assert_called_once()
+        assert mock_run_review.call_args[0][0] == "delta diff content"
+        assert mock_run_review.call_args[1]["previous_review"] == "Vorheriger Kommentar mit Mängeln"
+        assert mock_run_review.call_args[1]["last_sha"] == "1111111"
+
+        posted_comment = mock_post.call_args[0][0]
+        assert "Inkrementelles Re-Review" in posted_comment
+        assert "1111111" in posted_comment
+

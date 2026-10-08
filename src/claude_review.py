@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Claude PR Review Gate: Analysiert Pull Request Diffs und agiert als CI-Gatekeeper."""
 
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 
 # `or` statt Default-Argument: Workflow-Expressions können leere Strings liefern.
 MODEL = os.environ.get("REVIEW_MODEL") or "claude-sonnet-5-5"
-EFFORT = os.environ.get("REVIEW_EFFORT") or "high"
+EFFORT = os.environ.get("REVIEW_EFFORT") or "medium"
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16000"))
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "400000"))
@@ -21,6 +23,9 @@ MAX_GUIDELINES_CHARS = int(os.environ.get("MAX_GUIDELINES_CHARS", "20000"))
 DIFF_FILE = Path(os.environ.get("DIFF_FILE", "pr_diff.txt"))
 STAT_FILE = Path(os.environ.get("STAT_FILE", "pr_stat.txt"))
 MAX_STAT_CHARS = int(os.environ.get("MAX_STAT_CHARS", "20000"))
+HEADER_SHA_PATTERN = re.compile(
+    r"## 🤖 Claude Review Gate(?: \(`?([0-9a-fA-F]{7,40})`?\))?:"
+)
 
 SYSTEM_PROMPT = """\
 Du bist ein erfahrener Senior-Reviewer und Gatekeeper für Pull Requests.
@@ -49,7 +54,10 @@ Regeln:
   und deren Auswirkung.
 - Nutze `<changed_files>` für den Gesamtüberblick (z. B. ob Tests zu neuen Features fehlen),
   aber bewerte konkrete Code-Probleme anhand von `<diff>`.
-- Fasse dich kurz: maximal 10 Findings, die wichtigsten zuerst.
+- Melde ausnahmslos ALLE relevanten Blocker- und Major-Issues in einem Durchgang, damit
+  der Autor alle kritischen Probleme auf einmal beheben kann (kein stückweises Aufdecken).
+  Beschränke dich bei Minor-Issues auf die wichtigsten Punkte.
+- Fasse dich bei den Problem- und Lösungserklärungen präzise und prägnant.
 - Severity: "blocker" = Bug/Sicherheitslücke/Datenverlust, "major" = klarer Design- oder
   Wartbarkeitsmangel, der vor dem Merge behoben werden sollte, "minor" = sinnvolle
   Verbesserung, nicht merge-blockierend.
@@ -185,7 +193,171 @@ def validate_review_payload(review: dict) -> dict:
     return review
 
 
-def run_review(diff: str) -> dict:
+def parse_diff_excludes(excludes_str: str) -> list[str]:
+    """Parst DIFF_EXCLUDES (zeilen- oder leerzeichengetrennt) in git-diff-kompatible Pfadargumente."""
+    args = []
+    for line in excludes_str.splitlines():
+        for item in line.split():
+            item = item.strip("'\"")
+            if item:
+                args.append(item)
+    return args
+
+
+def is_ancestor_commit(sha: str) -> bool:
+    """Prüft sprachunabhängig per git merge-base, ob sha ein Vorfahre von HEAD ist."""
+    try:
+        git_env = os.environ.copy()
+        git_env["LC_ALL"] = "C"
+        res = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+            capture_output=True,
+            env=git_env,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def fetch_previous_review(pr_number: str | None = None) -> tuple[str, str]:
+    """
+    Liest vorherige Kommentare im PR via GitHub CLI ein.
+    Gibt (commit_sha, comment_body) des letzten Claude-Review-Kommentars zurück.
+    """
+    pr_num = pr_number or os.environ.get("PR_NUMBER")
+    if not pr_num:
+        return "", ""
+
+    current_sha = os.environ.get("PR_HEAD_SHA", "")
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(pr_num), "--json", "comments"],
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        data = json.loads(result.stdout)
+        comments = data.get("comments", [])
+    except Exception as exc:
+        print(f"Info: Vorherige PR-Kommentare konnten nicht geladen werden ({exc}).")
+        return "", ""
+
+    for comment in reversed(comments):
+        body = comment.get("body", "")
+        match = HEADER_SHA_PATTERN.search(body)
+        if match and match.group(1) and ("PASSED" in body or "CHANGES REQUESTED" in body):
+            sha = match.group(1)
+            # Überspringen, wenn es sich um denselben Commit wie HEAD handelt (z. B. Re-Run)
+            if current_sha and sha.lower() == current_sha[: len(sha)].lower():
+                continue
+            return sha, body
+
+    return "", ""
+
+
+def get_incremental_diff(
+    last_sha: str, context_lines: int, excludes: list[str]
+) -> tuple[str, str, bool]:
+    """
+    Berechnet das Delta zwischen last_sha und HEAD (git diff last_sha..HEAD).
+    Liefert (diff, stat, truncated).
+    """
+    git_env = os.environ.copy()
+    git_env["LC_ALL"] = "C"
+
+    stat_cmd = ["git", "diff", "--stat", f"{last_sha}..HEAD", "--", "."] + excludes
+    stat_res = subprocess.run(
+        stat_cmd,
+        capture_output=True,
+        text=True,
+        check=True,
+        encoding="utf-8",
+        errors="replace",
+        env=git_env,
+    )
+    stat = stat_res.stdout[:MAX_STAT_CHARS]
+
+    diff_cmd = [
+        "git",
+        "diff",
+        f"-U{context_lines}",
+        f"{last_sha}..HEAD",
+        "--",
+        ".",
+    ] + excludes
+    diff_res = subprocess.run(
+        diff_cmd,
+        capture_output=True,
+        text=True,
+        check=True,
+        encoding="utf-8",
+        errors="replace",
+        env=git_env,
+    )
+    full_diff = diff_res.stdout
+    truncated = len(full_diff) > MAX_DIFF_CHARS
+    return full_diff[:MAX_DIFF_CHARS], stat, truncated
+
+
+def log_usage(usage: Any) -> None:
+    """Protokolliert Token-Verbrauch in Konsole und schreibt Zusammenfassung in GITHUB_STEP_SUMMARY."""
+    if not usage:
+        return
+
+    def _int_or_zero(val: Any) -> int:
+        return val if isinstance(val, int) else 0
+
+    input_tokens = _int_or_zero(getattr(usage, "input_tokens", 0))
+    output_tokens = _int_or_zero(getattr(usage, "output_tokens", 0))
+    cache_creation = _int_or_zero(getattr(usage, "cache_creation_input_tokens", 0))
+    cache_read = _int_or_zero(getattr(usage, "cache_read_input_tokens", 0))
+    total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+
+    print("\n--- 🪙 Token Usage ---")
+    print(f"Input Tokens:        {input_tokens:,}")
+    print(f"Output Tokens:       {output_tokens:,}")
+    if cache_creation or cache_read:
+        print(f"Cache Creation:      {cache_creation:,}")
+        print(f"Cache Read:          {cache_read:,}")
+    print(f"Total Tokens:        {total_tokens:,}")
+    print("-----------------------\n")
+
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_file:
+        try:
+            summary_path = Path(summary_file)
+            summary_md = [
+                "",
+                "### 🪙 Claude Review Token Usage",
+                "| Metrik | Tokens |",
+                "| :--- | :--- |",
+                f"| Input Tokens | {input_tokens:,} |",
+                f"| Output Tokens (inkl. Reasoning) | {output_tokens:,} |",
+            ]
+            if cache_creation or cache_read:
+                summary_md.extend([
+                    f"| Cache Creation Tokens | {cache_creation:,} |",
+                    f"| Cache Read Tokens | {cache_read:,} |",
+                ])
+            summary_md.extend([
+                f"| **Gesamt** | **{total_tokens:,}** |",
+                "",
+            ])
+            with summary_path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(summary_md) + "\n")
+        except Exception as err:
+            print(f"Warnung: Konnte Token-Usage nicht in GITHUB_STEP_SUMMARY schreiben: {err}")
+
+
+def run_review(
+    diff: str,
+    previous_review: str = "",
+    last_sha: str = "",
+    file_summary: str | None = None,
+) -> dict:
     if EFFORT not in ALLOWED_EFFORTS:
         raise RuntimeError(
             f"Ungültiger Effort-Wert '{EFFORT}'. Erlaubt: {', '.join(sorted(ALLOWED_EFFORTS))}"
@@ -198,10 +370,10 @@ def run_review(diff: str) -> dict:
         else ""
     )
 
-    file_summary = read_file_summary()
+    summary_text = file_summary if file_summary is not None else read_file_summary()
     changed_files = (
-        f"\n\n<changed_files>\n{sanitize_xml_tag(file_summary, 'changed_files')}\n</changed_files>"
-        if file_summary
+        f"\n\n<changed_files>\n{sanitize_xml_tag(summary_text, 'changed_files')}\n</changed_files>"
+        if summary_text
         else ""
     )
 
@@ -209,11 +381,30 @@ def run_review(diff: str) -> dict:
     body = sanitize_xml_tag(os.environ.get("PR_BODY", "") or "(keine)", "pr_description")
     diff_clean = sanitize_xml_tag(diff, "diff")
 
+    incremental_section = ""
+    if previous_review:
+        prev_clean = sanitize_xml_tag(previous_review, "previous_review")
+        sha_info = f' last_reviewed_sha="{last_sha}"' if last_sha else ""
+        incremental_section = (
+            f"\n\n<incremental_review{sha_info}>\n"
+            "ACHTUNG - INKREMENTELLES RE-REVIEW:\n"
+            f"Dies ist ein Folge-Review. Der bereitgestellte Diff zeigt ausschließlich die Änderungen seit dem letzten Review ({last_sha or 'vorheriger Stand'}).\n"
+            "In <previous_review> findest du den vorherigen Review-Kommentar mit den damaligen Befunden.\n\n"
+            "Deine Prüfaufgaben:\n"
+            "1. Prüfe, ob die in <previous_review> beanstandeten Punkte durch das neue Delta behoben wurden.\n"
+            "2. Prüfe das Delta in <diff> auf neu entstandene Bugs, Sicherheitslücken oder Architekturmängel.\n"
+            "3. Gib in 'issues' NUR Punkte zurück, die weiterhin ungelöst sind oder im Delta neu entstanden sind.\n"
+            "   Erfolgreich behobene Punkte gehören NICHT mehr in 'issues' (erwähne sie positiv in der 'summary').\n"
+            f"<previous_review>\n{prev_clean}\n</previous_review>\n"
+            "</incremental_review>"
+        )
+
     user_content = (
         f"<pr_title>{title}</pr_title>\n"
         f"<pr_description>{body}</pr_description>"
         f"{project_rules}"
-        f"{changed_files}\n\n<diff>\n{diff_clean}\n</diff>"
+        f"{changed_files}"
+        f"{incremental_section}\n\n<diff>\n{diff_clean}\n</diff>"
     )
 
     response = client.messages.create(
@@ -225,6 +416,9 @@ def run_review(diff: str) -> dict:
         messages=[{"role": "user", "content": user_content}],
     )
 
+    if hasattr(response, "usage"):
+        log_usage(response.usage)
+
     if response.stop_reason == "max_tokens":
         raise RuntimeError("Review wurde durch max_tokens abgeschnitten")
 
@@ -234,11 +428,20 @@ def run_review(diff: str) -> dict:
     raise RuntimeError(f"Kein Review-Ergebnis erhalten (stop_reason={response.stop_reason})")
 
 
-def format_comment(review: dict, passed: bool, truncated: bool) -> str:
+def format_comment(
+    review: dict, passed: bool, truncated: bool, last_sha: str = ""
+) -> str:
     icon = "✅ **PASSED**" if passed else "❌ **CHANGES REQUESTED**"
     lines = [
         format_header(icon),
         "",
+    ]
+    if last_sha:
+        lines += [
+            f"> ℹ️ **Inkrementelles Re-Review** (Delta seit `{last_sha}`)",
+            "",
+        ]
+    lines += [
         f"**Zusammenfassung:** {review['summary']}",
         "",
     ]
@@ -276,19 +479,67 @@ def post_comment(body: str) -> None:
 
 
 def main() -> int:
-    if not DIFF_FILE.exists() or DIFF_FILE.stat().st_size == 0:
-        print("Diff ist leer. Nichts zu reviewen.")
-        return 0
+    # 1. Prüfen, ob ein inkrementelles Re-Review möglich ist
+    last_sha, prev_comment = fetch_previous_review()
+    is_incremental = False
+    diff = ""
+    truncated = False
+    inc_stat = None
+
+    if last_sha and is_ancestor_commit(last_sha):
+        excludes = parse_diff_excludes(os.environ.get("DIFF_EXCLUDES", ""))
+        context_lines_str = os.environ.get("DIFF_CONTEXT_LINES", "5")
+        try:
+            context_lines = int(context_lines_str)
+        except ValueError:
+            context_lines = 5
+
+        try:
+            inc_diff, inc_stat, inc_truncated = get_incremental_diff(
+                last_sha, context_lines, excludes
+            )
+            if inc_diff.strip():
+                diff = inc_diff
+                truncated = inc_truncated
+                is_incremental = True
+                print(
+                    f"Inkrementeller Review-Modus: Delta von {last_sha} bis HEAD ({len(diff)} Zeichen)."
+                )
+            else:
+                print(
+                    f"Keine Änderungen im Delta seit {last_sha}. Fallback auf vollen Diff."
+                )
+        except Exception as exc:
+            print(
+                f"Warnung: Fehler bei Ermittlung des inkrementellen Diffs ({exc}). Fallback auf vollen Diff."
+            )
+
+    if not is_incremental:
+        if not DIFF_FILE.exists() or DIFF_FILE.stat().st_size == 0:
+            print("Diff ist leer. Nichts zu reviewen.")
+            return 0
+        diff, truncated = read_diff()
 
     try:
-        diff, truncated = read_diff()
-        review = run_review(diff)
+        review = run_review(
+            diff,
+            previous_review=prev_comment if is_incremental else "",
+            last_sha=last_sha if is_incremental else "",
+            file_summary=inc_stat if is_incremental else None,
+        )
 
         issues = review["issues"]
         blocking = find_blocking_issues(issues)
         passed = not blocking and not truncated
 
-        post_comment(format_comment(review, passed, truncated))
+        post_comment(
+            format_comment(
+                review,
+                passed,
+                truncated,
+                last_sha=last_sha if is_incremental else "",
+            )
+        )
         if passed:
             print("Review bestanden.")
         elif truncated and not blocking:
