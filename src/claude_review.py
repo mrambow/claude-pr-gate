@@ -15,6 +15,7 @@ from anthropic import Anthropic
 MODEL = os.environ.get("REVIEW_MODEL") or "claude-sonnet-5-5"
 EFFORT = os.environ.get("REVIEW_EFFORT") or "medium"
 ALLOWED_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+REVIEW_ATTEMPTS = 2  # 1 Retry bei ungültigem Review-Payload
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16000"))
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "400000"))
 FAIL_ON_TRUNCATED = os.environ.get("FAIL_ON_TRUNCATED", "false").lower() in ("true", "1", "yes")
@@ -73,14 +74,17 @@ Antworte ausschließlich über das Tool `submit_review`. Schreibe deutsch.
 REVIEW_TOOL = {
     "name": "submit_review",
     "description": "Übermittelt das Ergebnis des Code-Reviews.",
+    "strict": True,
     "input_schema": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "summary": {"type": "string", "description": "Fazit in 1-3 Sätzen."},
             "issues": {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                         "category": {
@@ -408,25 +412,41 @@ def run_review(
         f"{incremental_section}\n\n<diff>\n{diff_clean}\n</diff>"
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        output_config={"effort": EFFORT},
-        system=SYSTEM_PROMPT,
-        tools=[REVIEW_TOOL],
-        messages=[{"role": "user", "content": user_content}],
-    )
+    last_error: RuntimeError | None = None
+    for attempt in range(1, REVIEW_ATTEMPTS + 1):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            output_config={"effort": EFFORT},
+            system=SYSTEM_PROMPT,
+            tools=[REVIEW_TOOL],
+            tool_choice={"type": "tool", "name": "submit_review"},
+            messages=[{"role": "user", "content": user_content}],
+        )
 
-    if hasattr(response, "usage"):
-        log_usage(response.usage)
+        if hasattr(response, "usage"):
+            log_usage(response.usage)
 
-    if response.stop_reason == "max_tokens":
-        raise RuntimeError("Review wurde durch max_tokens abgeschnitten")
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError("Review wurde durch max_tokens abgeschnitten")
 
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "submit_review":
+        block = next(
+            (b for b in response.content if b.type == "tool_use" and b.name == "submit_review"),
+            None,
+        )
+        if block is None:
+            last_error = RuntimeError(
+                f"Kein Review-Ergebnis erhalten (stop_reason={response.stop_reason})"
+            )
+            continue
+        try:
             return validate_review_payload(block.input)
-    raise RuntimeError(f"Kein Review-Ergebnis erhalten (stop_reason={response.stop_reason})")
+        except RuntimeError as exc:
+            raw = json.dumps(block.input, ensure_ascii=False, default=str)[:500]
+            print(f"::warning::Versuch {attempt}/{REVIEW_ATTEMPTS}: {exc} Payload: {raw}")
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def format_comment(
