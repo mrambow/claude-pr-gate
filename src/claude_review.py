@@ -420,7 +420,6 @@ def run_review(
             output_config={"effort": EFFORT},
             system=SYSTEM_PROMPT,
             tools=[REVIEW_TOOL],
-            tool_choice={"type": "tool", "name": "submit_review"},
             messages=[{"role": "user", "content": user_content}],
         )
 
